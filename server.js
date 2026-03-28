@@ -6,12 +6,13 @@ const { v4: uuidv4 } = require('uuid');
 const OpenAI = require('openai');
 const { Resend } = require('resend');
 
+const resend = new Resend(process.env.RESEND_API_KEY);
 const app = express();
 app.use(cors());
 app.use(express.json());
 
 const openai = new OpenAI({ apiKey: process.env.OPENAI_API_KEY });
-const resend = new Resend(process.env.RESEND_API_KEY);
+
 
 // ─── Doctor Data ───────────────────────────────────────────────────────────────
 const doctors = [
@@ -168,6 +169,17 @@ app.post('/api/chat', async (req, res) => {
     session.matchedDoctor = matchDoctor(message);
   }
 
+if (session.bookedSlot) {
+    console.log('BLOCKED: Appointment already exists');
+    return res.json({
+      reply: "You already have a confirmed appointment. If you need to reschedule, please call our office at (415) 555-0100.",
+      patient: session.patient,
+      matchedDoctor: session.matchedDoctor,
+      bookedSlot: session.bookedSlot,
+      availableSlots: []
+    });
+  }
+
   session.messages.push({ role: 'user', content: message });
 
   let availableSlots = [];
@@ -246,33 +258,61 @@ app.get('/api/session/:sessionId', (req, res) => {
 // ─── Email ─────────────────────────────────────────────────────────────────────
 async function sendConfirmationEmail(session) {
   const { patient, matchedDoctor, bookedSlot } = session;
-  const apptTime = formatSlotDisplay(bookedSlot.datetime);
+  
+  const datetime = new Date(bookedSlot.datetime).toLocaleString('en-US', {
+    timeZone: 'UTC',
+    weekday: 'long', month: 'long', day: 'numeric',
+    hour: 'numeric', minute: '2-digit',
+  });
+
+  const emailHtml = `
+    <!DOCTYPE html>
+    <html>
+    <head>
+      <style>
+        body { font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', sans-serif; line-height: 1.6; color: #333; max-width: 600px; margin: 0 auto; padding: 20px; }
+        .header { text-align: center; margin-bottom: 30px; }
+        .header h1 { color: #2563eb; margin: 0; }
+        .content { background: #f8fafc; border-radius: 8px; padding: 30px; }
+        .info-row { display: flex; margin: 15px 0; }
+        .info-label { font-weight: 600; min-width: 120px; }
+        .info-value { color: #475569; }
+        .footer { text-align: center; margin-top: 30px; color: #64748b; font-size: 14px; }
+      </style>
+    </head>
+    <body>
+      <div class="header">
+        <h1>Appointment Confirmed</h1>
+      </div>
+      <div class="content">
+        <p>Dear ${patient.firstName} ${patient.lastName},</p>
+        <p>Your appointment has been successfully scheduled.</p>
+        <div class="info-row"><div class="info-label">Doctor</div><div class="info-value">${matchedDoctor.name}</div></div>
+        <div class="info-row"><div class="info-label">Specialty</div><div class="info-value">${matchedDoctor.specialty}</div></div>
+        <div class="info-row"><div class="info-label">Date & Time</div><div class="info-value">${datetime}</div></div>
+        <div class="info-row"><div class="info-label">Reason</div><div class="info-value">${patient.reason}</div></div>
+        <div class="info-row"><div class="info-label">Location</div><div class="info-value">123 Medical Center Drive, San Francisco, CA 94102</div></div>
+        <p style="margin-top: 30px;">Please arrive 15 minutes early to complete any required paperwork.</p>
+        <p>If you need to reschedule, please call us at (415) 555-0100.</p>
+      </div>
+      <div class="footer">
+        <p>Kyron Medical Practice</p>
+      </div>
+    </body>
+    </html>
+  `;
+
   try {
+    console.log('Sending confirmation email to:', patient.email);
     await resend.emails.send({
       from: 'Kyron Medical <onboarding@resend.dev>',
-      to: patient.email,
-      subject: 'Your Appointment Confirmation — Kyron Medical',
-      html: `
-        <div style="font-family: sans-serif; max-width: 600px; margin: 0 auto;">
-          <h2 style="color: #0ea5e9;">Appointment Confirmed</h2>
-          <p>Dear ${patient.firstName || 'Valued Patient'} ${patient.lastName || ''},</p>
-          <p>Your appointment has been successfully scheduled.</p>
-          <table style="border-collapse: collapse; width: 100%; margin: 20px 0;">
-            <tr><td style="padding: 8px; font-weight: bold;">Doctor</td><td style="padding: 8px;">${matchedDoctor.name}</td></tr>
-            <tr style="background:#f8fafc;"><td style="padding: 8px; font-weight: bold;">Specialty</td><td style="padding: 8px;">${matchedDoctor.specialty}</td></tr>
-            <tr><td style="padding: 8px; font-weight: bold;">Date & Time</td><td style="padding: 8px;">${apptTime}</td></tr>
-            <tr style="background:#f8fafc;"><td style="padding: 8px; font-weight: bold;">Reason</td><td style="padding: 8px;">${patient.reason}</td></tr>
-            <tr><td style="padding: 8px; font-weight: bold;">Location</td><td style="padding: 8px;">123 Medical Center Drive, San Francisco, CA 94102</td></tr>
-          </table>
-          <p>Please arrive 15 minutes early to complete any required paperwork.</p>
-          <p>If you need to reschedule, please call us at (415) 555-0100.</p>
-          <p style="color: #64748b; font-size: 14px;">Kyron Medical Practice</p>
-        </div>
-      `,
+      to: [patient.email],
+      subject: 'Appointment Confirmed - Kyron Medical',
+      html: emailHtml,
     });
     console.log('Confirmation email sent to', patient.email);
-  } catch (err) {
-    console.error('Email error:', err);
+  } catch (error) {
+    console.error('Email error:', error);
   }
 }
 
@@ -311,10 +351,26 @@ function formatPhone(phone) {
 
 // ─── Vapi Call Endpoint ────────────────────────────────────────────────────────
 app.post('/api/vapi/call', async (req, res) => {
-  const { sessionId, patient } = req.body;
+  const { sessionId, phoneNumber, patient: reqPatient } = req.body;
   const session = sessions[sessionId];
+  
+  // Use phoneNumber from request body if provided, otherwise fall back to patient object
+  const phone = phoneNumber || reqPatient?.phone || session?.patient?.phone || '';
+  const patientData = reqPatient || session?.patient || {};
+  
+  if (!phone) {
+    return res.status(400).json({ success: false, error: 'Phone number is required' });
+  }
+  
+  // ← ADD THIS: Update session with phone number
+  if (session && phone) {
+    if (!session.patient) session.patient = {};
+    session.patient.phone = phone;
+    console.log('Updated session with phone:', phone);
+  }
+  
   const context = session ? session.messages.slice(-6).map(m => `${m.role}: ${m.content}`).join('\n') : '';
-
+  
   try {
     const response = await fetch('https://api.vapi.ai/call/phone', {
       method: 'POST',
@@ -322,32 +378,143 @@ app.post('/api/vapi/call', async (req, res) => {
         'Authorization': `Bearer ${process.env.VAPI_API_KEY}`,
         'Content-Type': 'application/json',
       },
-      body: JSON.stringify({
+body: JSON.stringify({
         assistantId: process.env.VAPI_ASSISTANT_ID,
         phoneNumberId: process.env.VAPI_PHONE_NUMBER_ID,
-        customer: { number: formatPhone(patient?.phone || '') },
+        customer: { number: formatPhone(phone) },
         assistantOverrides: {
-          firstMessage: `Hello ${patient?.firstName || 'there'}! I can see you were just chatting with us online. ${session?.matchedDoctor ? `You were being matched with ${session.matchedDoctor.name} for ${session.patient?.reason || 'your concern'}.` : ''} ${session?.bookedSlot ? `You have an appointment booked for ${formatSlotDisplay(session.bookedSlot.datetime)}.` : ''} How can I help you continue?`,
+          firstMessage: `Hello ${patientData?.firstName || 'there'}! I can see you were just chatting with us online. ${session?.matchedDoctor ? `You were being matched with ${session.matchedDoctor.name} for ${session.patient?.reason || 'your concern'}.` : ''} ${session?.bookedSlot ? `You have an appointment booked for ${formatSlotDisplay(session.bookedSlot.datetime)}.` : ''} How can I help you continue?`,
           model: {
             provider: 'openai',
             model: 'gpt-4o-mini',
             messages: [
               {
                 role: 'system',
-                content: `You are the Kyron Medical AI receptionist. Here is the context from the patient's web chat:\n\n${context}\n\nPatient name: ${patient?.firstName || ''} ${patient?.lastName || ''}\nDOB: ${patient?.dob || 'not provided'}\nPhone: ${patient?.phone || 'not provided'}\nEmail: ${patient?.email || 'not provided'}\nReason: ${patient?.reason || 'not provided'}\n\nContinue helping this patient warmly. Never provide medical advice.`
+                content: `You are the Kyron Medical AI receptionist. Here is the context from the patient's web chat:\n\n${context}\n\nPatient name: ${patientData?.firstName || ''} ${patientData?.lastName || ''}\nDOB: ${patientData?.dob || 'not provided'}\nPhone: ${phone}\nEmail: ${patientData?.email || 'not provided'}\nReason: ${patientData?.reason || 'not provided'}\n\nContinue helping this patient warmly. Never provide medical advice.`
               }
             ]
           }
         }
       }),
     });
+    
     const data = await response.json();
-    if (data.id) res.json({ success: true, callId: data.id });
-    else res.json({ success: false, error: data });
+if (!response.ok) {
+      console.error('Vapi API error:', data);
+      return res.status(response.status).json({ success: false, error: data });
+    }
+    
+    if (data.id) {
+      res.json({ success: true, callId: data.id });
+    } else {
+      res.json({ success: false, error: data });
+    }
   } catch (err) {
     console.error('Vapi error:', err);
-    res.status(500).json({ success: false });
+    res.status(500).json({ success: false, error: err.message });
   }
+});
+
+app.post('/api/vapi/inbound', async (req, res) => {
+  const { message } = req.body;
+  if (message?.type === 'assistant-request') {
+    const callerPhone = message?.call?.customer?.number || '';
+    const normalizedPhone = callerPhone.replace(/\D/g, '');
+    const session = Object.values(sessions).find(s => {
+      const sessionPhone = (s.patient?.phone || '').replace(/\D/g, '');
+      return sessionPhone && normalizedPhone.endsWith(sessionPhone) || sessionPhone.endsWith(normalizedPhone.slice(-10));
+    });
+const context = session ? session.messages.slice(-6).map(m => `${m.role}: ${m.content}`).join('\n') : '';
+    const hasContext = session && context;
+ res.json({
+      assistant: {
+        firstMessage: hasContext
+          ? `Hello ${session.patient?.firstName || 'there'}! Welcome back to Kyron Medical. I can see you were chatting with us recently${session.bookedSlot ? ` and have an appointment booked for ${formatSlotDisplay(session.bookedSlot.datetime)}` : ''}. How can I help you today?`
+          : `Hello! Thank you for calling Kyron Medical. I'm your AI receptionist. How can I help you today?`,
+        model: {
+          provider: 'openai',
+          model: 'gpt-4o-mini',
+          messages: [{
+            role: 'system',
+            content: hasContext
+              ? `You are the Kyron Medical AI receptionist. This patient called back. Previous context:\n\n${context}\n\nPatient: ${session.patient?.firstName || ''} ${session.patient?.lastName || ''}, DOB: ${session.patient?.dob || ''}, Reason: ${session.patient?.reason || ''}. Continue helping them warmly. Never provide medical advice.`
+              : `You are the Kyron Medical AI receptionist. Help this patient warmly with scheduling, prescription refills, or office information. Never provide medical advice. Office: 123 Medical Center Drive, San Francisco. Hours: Mon-Fri 8am-5pm. Phone: (415) 555-0100.`
+          }]
+        },
+        voice: { provider: '11labs', voiceId: 'paula' }
+      }
+});
+  } else {
+    res.json({});
+  }
+});
+
+// ─── Vapi Tool: Get Available Slots ───────────────────────────────────────────
+app.post('/api/vapi/tool/get-slots', async (req, res) => {
+  const { reason } = req.body.message?.toolCallList?.[0]?.function?.arguments || req.body;
+  const doctor = matchDoctor(reason || '');
+  if (!doctor) {
+    return res.json({ results: [{ toolCallId: req.body.message?.toolCallList?.[0]?.id, result: 'No doctor found for that condition. We may not treat that at this practice.' }] });
+  }
+  const slots = getAvailableSlots(doctor.id);
+  const slotText = slots.map((s, i) => `${i+1}. ${s.display}`).join(', ');
+  const toolCallId = req.body.message?.toolCallList?.[0]?.id;
+  res.json({ results: [{ toolCallId, result: `Matched with ${doctor.name} (${doctor.specialty}). Available slots: ${slotText}` }] });
+});
+
+// ─── Vapi Tool: Book Appointment ──────────────────────────────────────────────
+app.post('/api/vapi/tool/book-appointment', async (req, res) => {
+  const args = req.body.message?.toolCallList?.[0]?.function?.arguments || req.body;
+  const toolCallId = req.body.message?.toolCallList?.[0]?.id;
+  const { firstName, lastName, dob, phone, email, reason, slotNumber } = args;
+
+  const doctor = matchDoctor(reason || '');
+  if (!doctor) {
+    return res.json({ results: [{ toolCallId, result: 'Could not match a doctor for that condition.' }] });
+  }
+
+  const slots = getAvailableSlots(doctor.id);
+  const idx = parseInt(slotNumber) - 1;
+  if (idx < 0 || idx >= slots.length) {
+    return res.json({ results: [{ toolCallId, result: 'Invalid slot number. Please choose between 1 and ' + slots.length }] });
+  }
+
+  const slot = bookSlot(doctor.id, slots[idx].id);
+  if (!slot) {
+    return res.json({ results: [{ toolCallId, result: 'That slot is no longer available. Please choose another.' }] });
+  }
+
+// Find session by phone number and update it
+const normalizedPhone = phone.replace(/\D/g, '');
+console.log('Looking for session with phone:', normalizedPhone);
+console.log('Active sessions:', Object.keys(sessions).length);
+console.log('Session phones:', Object.values(sessions).map(s => s.patient?.phone));
+
+const session = Object.values(sessions).find(s => {
+  const sessionPhone = (s.patient?.phone || '').replace(/\D/g, '');
+  console.log('Comparing:', normalizedPhone, 'vs', sessionPhone);
+  return sessionPhone && (normalizedPhone.endsWith(sessionPhone) || sessionPhone.endsWith(normalizedPhone.slice(-10)));
+});
+
+console.log('Found session:', session ? 'YES' : 'NO');
+
+if (session) {
+  session.patient = { firstName, lastName, dob, phone, email, reason };
+  session.matchedDoctor = doctor;
+  session.bookedSlot = slot;
+  console.log('Updated session:', session.patient);
+}
+
+  if (email) {
+    const sessionData = {
+      patient: { firstName, lastName, dob, phone, email, reason },
+      matchedDoctor: doctor,
+      bookedSlot: slot
+    };
+    await sendConfirmationEmail(sessionData);
+  }
+
+  res.json({ results: [{ toolCallId, result: `Appointment confirmed with ${doctor.name} for ${formatSlotDisplay(slot.datetime)}. A confirmation email has been sent to ${email}.` }] });
 });
 
 // ─── Health Check ──────────────────────────────────────────────────────────────

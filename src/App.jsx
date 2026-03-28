@@ -30,9 +30,40 @@ export default function App() {
     messagesEndRef.current?.scrollIntoView({ behavior: "smooth" });
   }, [messages]);
 
+  useEffect(() => {
+    if (!callActive) return;
+
+    const pollInterval = setInterval(async () => {
+      try {
+        const { data } = await axios.get(`${API_BASE}/api/session/${sessionId}`);
+        if (data.bookedSlot && !bookedSlot) {
+          setBookedSlot(data.bookedSlot);
+          setMatchedDoctor(data.matchedDoctor);
+          setPatient(data.patient);
+          setAvailableSlots([]); // Clear slots when booking detected
+          setMessages(prev => [...prev, {
+            role: 'assistant',
+            content: `Great news! Your appointment has been confirmed via phone for ${formatTime(data.bookedSlot.datetime)} with ${data.matchedDoctor.name}.`
+          }]);
+        }
+      } catch (err) {
+        console.error('Poll error:', err);
+      }
+    }, 3000);
+
+    return () => clearInterval(pollInterval);
+  }, [callActive, sessionId, bookedSlot]);
+
   const sendMessage = async (text) => {
     const userMsg = text || input.trim();
     if (!userMsg) return;
+
+    // NUCLEAR FIX: Don't allow any booking if already booked
+    if (bookedSlot && userMsg.toLowerCase().includes("option")) {
+      console.log("Blocked: Already booked");
+      return;
+    }
+
     setInput("");
     setMessages((prev) => [...prev, { role: "user", content: userMsg }]);
     setLoading(true);
@@ -78,15 +109,19 @@ export default function App() {
     try {
       const { data } = await axios.post(`${API_BASE}/api/vapi/call`, {
         sessionId,
+        phoneNumber: patientData?.phone,
         patient: patientData,
       });
       if (data.success) {
-        setCallStatus("Call incoming from +1 (747) 494 9286");
+        setCallStatus("Call incoming from +1 (866) 578 3340");
+        // Keep polling for 30 seconds after call starts
+        setTimeout(() => setCallActive(false), 30000);
       } else {
         setCallStatus("Unable to initiate call. Please try again.");
         setTimeout(() => setCallActive(false), 3000);
       }
-    } catch {
+    } catch (err) {
+      console.error('Call error:', err);
       setCallStatus("Call feature unavailable. Please call (415) 555-0100.");
       setTimeout(() => setCallActive(false), 4000);
     }
@@ -196,7 +231,7 @@ export default function App() {
               </div>
             ))}
 
-            {availableSlots.length > 0 && (
+            {availableSlots.length > 0 && !bookedSlot && (
               <div className="slots-container">
                 <div className="slots-title">Available appointments:</div>
                 <div className="slots-grid">
@@ -205,6 +240,7 @@ export default function App() {
                       key={slot.id}
                       className="slot-btn"
                       onClick={() => sendMessage(`I'll take option ${i + 1}`)}
+                      disabled={bookedSlot}
                     >
                       <span className="slot-num">{i + 1}</span>
                       <span className="slot-time">{slot.display}</span>
